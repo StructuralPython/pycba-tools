@@ -1,0 +1,34 @@
+[project]
+name = "pycba-tools"
+dynamic = ['version', 'description']
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Connor Ferster", email = "connor@structuralpython.com" }
+]
+
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0.2",
+    "pycba>=1.0.2",
+    "pydantic>=2.12.0",
+    "deepmerge>=2.0",
+]
+
+[project.urls]
+Source = "https://github.com/StructuralPython/pycba-tools"
+
+[build-system]
+requires = ["flit_core>=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "pycba_tools"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+    # Parity tests compare pycba-tools against PyniteFEA / pynite-tools
+    "pynitefea>=2.1.0",
+    "pynite-tools>=0.8.1",
+]
