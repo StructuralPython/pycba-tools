@@ -166,6 +166,21 @@ The JSON contains the model's *input* data: the member name, node names and loca
 `GAv` and `kf`, the number of evaluation points, load cases (as pycba load matrix rows) and load
 combinations. It is tagged `"backend": "pycba"`.
 
+It also carries a `metadata` block naming the library the model is for, that library's version
+and the package and version that wrote it:
+
+```json
+"metadata": {
+  "library": "pycba",
+  "library_version": "1.0.2",
+  "generator": "pycba-tools",
+  "generator_version": "0.2.0"
+}
+```
+
+pynite-tools writes the same block (with `"Pynite"` and `"pynite-tools"`). The block is optional
+when loading, so older files still load, but a model whose `library` isn't `"pycba"` is refused.
+
 Analysis results are not serialized: re-run the analysis after loading. Non-prismatic
 (`SectionEI`) members are not supported yet.
 
