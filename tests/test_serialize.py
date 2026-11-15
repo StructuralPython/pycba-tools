@@ -149,3 +149,28 @@ def test_empty_load_case_survives():
 def test_dump_rejects_other_objects():
     with pytest.raises(TypeError):
         pt.dump_dict({"not": "a model"})
+
+
+def test_dump_records_library_and_generator_versions():
+    from importlib.metadata import version
+
+    metadata = pt.dump_dict(hinged_model())["metadata"]
+    assert metadata == {
+        "library": "pycba",
+        "library_version": version("pycba"),
+        "generator": "pycba-tools",
+        "generator_version": pt.__version__,
+    }
+
+
+def test_load_accepts_models_without_metadata():
+    data = pt.dump_dict(hinged_model())
+    del data["metadata"]
+    assert pt.load_dict(data).name == "G1"
+
+
+def test_load_refuses_a_model_for_another_library():
+    data = pt.dump_dict(hinged_model())
+    data["metadata"]["library"] = "Pynite"
+    with pytest.raises(ValueError, match="for 'Pynite', not 'pycba'"):
+        pt.load_dict(data)

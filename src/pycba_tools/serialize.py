@@ -10,17 +10,32 @@ moduli), node names and locations, load cases (as pycba load matrix rows) and
 load combinations. Analysis results are not serialized; re-run the analysis
 after loading.
 
+Every dumped model also carries a `metadata` block saying which library the
+model is for, that library's version, and the package and version that wrote
+it:
+
+    "metadata": {"library": "pycba", "library_version": "1.0.2",
+                 "generator": "pycba-tools", "generator_version": "0.2.0"}
+
+The same block, with "Pynite" and "pynite-tools", is written by
+pynite_tools.serialize. It is optional when loading, so older files still load,
+but a model written for another library is refused.
+
 A pycba BeamAnalysis may also be passed to the dump functions; it is serialized
 as a CBAModel whose load matrix is load case "Case 1".
 """
 import json
 import pathlib
+from importlib.metadata import version
 from typing import Literal, Optional, TextIO
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pycba import BeamAnalysis
 
 from .model import CBAModel
+
+LIBRARY = "pycba"
+GENERATOR = "pycba-tools"
 
 
 def to_json(model: CBAModel | BeamAnalysis, filepath: str | pathlib.Path) -> None:
@@ -119,6 +134,31 @@ class _Schema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MetadataSchema(_Schema):
+    """
+    Which library a model is for and what wrote it. When a model is dumped,
+    the versions are those installed.
+    """
+
+    library: Literal["pycba"] = LIBRARY
+    library_version: Optional[str] = Field(default_factory=lambda: version(LIBRARY))
+    generator: Optional[str] = GENERATOR
+    generator_version: Optional[str] = Field(default_factory=lambda: _generator_version())
+
+    @field_validator("library", mode="before")
+    @classmethod
+    def _for_pycba(cls, value):
+        if value != LIBRARY:
+            raise ValueError(f"this model is for {value!r}, not {LIBRARY!r}; load it with that library's tools package")
+        return value
+
+
+def _generator_version() -> str:
+    from . import __version__
+
+    return __version__
+
+
 class LoadComboSchema(_Schema):
     name: str
     factors: dict[str, float]
@@ -131,6 +171,7 @@ class CBAModelSchema(_Schema):
     cases and load combinations.
     """
 
+    metadata: MetadataSchema = Field(default_factory=MetadataSchema)
     backend: Literal["pycba"] = "pycba"
     name: str = "M1"
     node_names: list[str]
