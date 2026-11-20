@@ -60,21 +60,66 @@ def test_linear_foundation_matches_hetenyi():
     assert m0 == pytest.approx(100e3 / (4 * LAMBDA), rel=1e-4)
 
 
-def test_free_ends_carry_no_moment():
+@pytest.mark.parametrize("kf_tension", [None, 0.0])
+def test_free_ends_carry_no_shear_or_moment(kf_tension):
     """
-    pycba recovers a foundation span's shear and moment from its bending
-    alone. Undivided, this beam's free end shows 3% of the load as shear and
-    1% of the peak moment; divided, 0.2% and nothing to speak of.
+    pycba 1.0.2 recovers a foundation span's shear and moment from bending
+    alone: on this footing a free end showed 45 kN of shear (9% of the load).
+    pycba-tools' recovery includes the foundation's reaction.
     """
     def add(m):
-        m.add_distributed_load(30e3, 30e3, case="D")
-        m.add_point_load(60e3, 3.0, case="D")
+        m.add_point_load(400e3, 1.2, case="D")
+        m.add_distributed_load(10e3, 30e3, 2.0, 6.0, case="D")
 
-    member = analysed(beam(), add).members["beam"]
-    peak = max(abs(member.max_moment("Mz", "D")), abs(member.min_moment("Mz", "D")))
+    model = pt.CBAModel(L=[6.0], EI=225e6, supports=["free", "free"], kf=KF, kf_tension=kf_tension, name="beam")
+    member = analysed(model, add).members["beam"]
     for end in (0.0, 6.0):
-        assert abs(member.moment("Mz", end, "D")) < 1e-4 * peak
-        assert abs(member.shear("Fy", end, "D")) < 3e-3 * 240e3  # Total load 240 kN.
+        assert abs(member.shear("Fy", end, "D")) < 1e-8 * 480e3
+        assert abs(member.moment("Mz", end, "D")) < 1e-8 * 480e3
+
+
+def test_shear_is_the_slope_of_the_moment():
+    """With the foundation's reaction in the recovery, dM/dx = V along the span."""
+    model = analysed(beam((6.0,)), lambda m: m.add_point_load(100e3, 1.5, case="D"))
+    for x in (np.linspace(0.05, 1.45, 200), np.linspace(1.55, 5.95, 600)):  # Either side of the load.
+        moment = -curve(model, "Mz", x)  # Sagging positive: dM/dx = V.
+        shear = curve(model, "Fy", x)
+        slope = np.gradient(moment, x)
+        np.testing.assert_allclose(slope[2:-2], shear[2:-2], atol=2e-3 * 100e3)
+
+
+def test_the_recovery_is_only_for_pycba_tools_beams():
+    """A plain pycba BeamAnalysis keeps pycba's own recovery."""
+    plain = BeamAnalysis(L=[6.0], EI=[EI], R=[0, 0, 0, 0], LM=[[1, 2, 100e3, 1.5]], kf=[KF])
+    plain.analyze(npts=200)
+    assert abs(plain.beam_results.vRes[0].V[1]) > 1e3  # pycba 1.0.2's free-end shear.
+
+
+def test_recovery_probe(monkeypatch):
+    """The recovery is used only when pycba needs it and it passes the probe."""
+    from pycba_tools import _recovery
+
+    def probe(stock, patched):
+        def result(patched_recovery):
+            value = patched if patched_recovery else stock
+            if isinstance(value, Exception):
+                raise value
+            return value
+        return result
+
+    for stock, patched, needed, warns in [
+        (0.0, 0.0, False, False),  # pycba already exact: nothing changes.
+        (0.06, 5e-7, True, False),  # pycba 1.0.2.
+        (0.06, 0.06, False, True),  # The recovery no longer works.
+        (0.06, AttributeError("Kcc_inv"), False, True),  # pycba's internals have changed.
+    ]:
+        monkeypatch.setattr(_recovery, "_needed", None)
+        monkeypatch.setattr(_recovery, "_probe_end_shear", lambda patched, f=probe(stock, patched): f(patched))
+        if warns:
+            with pytest.warns(UserWarning, match="could not correct"):
+                assert _recovery._recovery_needed() is needed
+        else:
+            assert _recovery._recovery_needed() is needed
 
 
 def test_divided_beam_matches_the_beam():

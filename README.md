@@ -132,11 +132,16 @@ x, p = model.members["F1"].foundation_reaction_array(201, "D")   # N/m, up posit
 | another value | Bilinear: `kf` in compression, `kf_tension` in tension |
 
 - **Divided spans.** Each span on a foundation is analysed divided into pieces about a tenth of
-  the characteristic length (4 EI / kf)<sup>1/4</sup> long, at least 16 per span. pycba recovers
-  a foundation span's shear and moment from its bending alone. On a whole span this shows up
-  as a few percent of the load at a free end; on the pieces, it is 0.2% of the load or less.
-  Results are reported at the model's own nodes and spans. `model.analyses[combo]` is the
-  divided beam.
+  the characteristic length (4 EI / kf)<sup>1/4</sup> long, at least 16 per span (none shorter
+  than a 40th of it). Results are reported at the model's own nodes and spans.
+  `model.analyses[combo]` is the divided beam.
+- **Exact shear and moment.** pycba 1.0.2 recovers a foundation span's shear and moment from its
+  bending alone: on a free-free footing under a 400 kN column, a free end showed 45 kN of shear
+  (9% of the load) where there is none. pycba-tools' analyses use a recovery that includes the
+  foundation's stiffness in each sub-element's end forces and its reaction along the
+  sub-element, so free ends come out at zero (about 1e-8 of the load) and the shear is the
+  slope of the moment. Only beams pycba-tools builds are affected, and only while pycba needs
+  it: a probe on first use checks pycba's own recovery, and keeps it if it is already exact.
 - **Contact iteration.** Where `kf_tension` differs from `kf`, each piece takes `kf` where the
   beam presses down and `kf_tension` where it lifts, and each combination is analysed again until
   no piece changes. The foundation is not linear, so each combination is analysed on its own
