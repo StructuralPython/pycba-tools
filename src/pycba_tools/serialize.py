@@ -183,6 +183,8 @@ class CBAModelSchema(_Schema):
     D: list[Optional[float]]
     GAv: Optional[list[Optional[float]]] = None
     kf: Optional[list[Optional[float]]] = None
+    # The foundation's stiffness in tension per span; None is the same as kf.
+    kf_tension: Optional[list[Optional[float]]] = None
     npts: int = 500
     load_cases: dict[str, list[list[int | float]]] = {}  # pycba load matrix rows
     load_combos: dict[str, LoadComboSchema] = {}
@@ -203,6 +205,7 @@ class CBAModelSchema(_Schema):
             D=self.D,
             GAv=self.GAv,
             kf=self.kf,
+            kf_tension=self.kf_tension,
             name=self.name,
             node_names=self.node_names,
             node_locations=self.node_locations,
