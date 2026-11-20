@@ -103,6 +103,53 @@ A Pynite `Fy` load of `-w` (downward) is a pycba load of `+w`. pycba is a planar
 the axial, torsional and out-of-plane results are always zero and are dropped from result trees
 exactly as pynite-tools drops all-zero results.
 
+### Beams on an elastic foundation
+
+`kf` is a Winkler foundation modulus per span (force per length, per length of beam, e.g. a
+subgrade modulus times the beam's width). On its own it is a linear foundation that acts in
+tension and compression, as pycba models it. `kf_tension` gives the foundation a different
+stiffness in tension:
+
+```python
+model = pt.CBAModel(
+    L=[3.0, 3.0], EI=2e8, supports=["free", "free", "free"],
+    kf=2.5e6,          # 5 MPa/m under a 0.5 m wide footing, in N/m/m
+    kf_tension=0.0,    # compression only: the beam can lift off
+    name="F1",
+)
+model.add_point_load(100e3, 0.5, case="D")
+model.add_load_combo("D", {"D": 1.0})
+model.analyze()
+
+model.solution                                         # 'Nonlinear'
+x, p = model.members["F1"].foundation_reaction_array(201, "D")   # N/m, up positive
+```
+
+| `kf_tension` | Foundation |
+|---|---|
+| `None` (default) | Linear: the same stiffness in tension and compression |
+| `0` | Compression only: the beam lifts off where it would pull the foundation up |
+| another value | Bilinear: `kf` in compression, `kf_tension` in tension |
+
+- **Divided spans.** Each span on a foundation is analysed divided into pieces about a tenth of
+  the characteristic length (4 EI / kf)<sup>1/4</sup> long, at least 16 per span. pycba recovers
+  a foundation span's shear and moment from its bending alone. On a whole span this shows up
+  as a few percent of the load at a free end; on the pieces, it is 0.2% of the load or less.
+  Results are reported at the model's own nodes and spans. `model.analyses[combo]` is the
+  divided beam.
+- **Contact iteration.** Where `kf_tension` differs from `kf`, each piece takes `kf` where the
+  beam presses down and `kf_tension` where it lifts, and each combination is analysed again until
+  no piece changes. The foundation is not linear, so each combination is analysed on its own
+  rather than added up from its cases. A beam that would lift clear of a compression-only
+  foundation, with no supports to hold it, raises a `ValueError`.
+- **Loads.** pycba's foundation spans take UDL, point and partial UDL loads. pycba-tools also
+  carries moments (on a short piece with no foundation, a twentieth of a piece long) and
+  trapezoidal loads (as steps of partial UDLs with the same total). Imposed curvature (type 6)
+  and moment releases on a foundation span are still not supported by pycba.
+- `foundation_reaction_array(n_points, combo_name, x_array=None)`, on the member and on each
+  span (`sub_members`), is the foundation modulus in use times the deflection: zero where the
+  beam has lifted off.
+
 ## Examples: `reports`
 
 ```python
@@ -163,7 +210,7 @@ case `"Case 1"`.
 
 The JSON contains the model's *input* data: the member name, node names and locations, spans,
 `EI`, the restraint vector `R` (supports and springs), element types, prescribed displacements,
-`GAv` and `kf`, the number of evaluation points, load cases (as pycba load matrix rows) and load
+`GAv`, `kf` and `kf_tension`, the number of evaluation points, load cases (as pycba load matrix rows) and load
 combinations. It is tagged `"backend": "pycba"`.
 
 It also carries a `metadata` block naming the library the model is for, that library's version
@@ -174,7 +221,7 @@ and the package and version that wrote it:
   "library": "pycba",
   "library_version": "1.0.2",
   "generator": "pycba-tools",
-  "generator_version": "0.2.0"
+  "generator_version": "0.3.0"
 }
 ```
 
