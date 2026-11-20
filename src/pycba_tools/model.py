@@ -55,16 +55,22 @@ LOAD_ROW_LENGTHS = {1: (3,), 2: (4,), 3: (5,), 4: (4,), 5: (4, 6)}  # 6: >= 3
 
 _TOL = 1e-9
 
-# Contact iteration (see CBAModel.analyze): pieces about a tenth of the
+# Divided foundation spans (see CBAModel.analyze): pieces about a tenth of the
 # foundation's characteristic length (4 EI / kf) ** 0.25, at least
-# _MIN_DIVISIONS and at most _MAX_DIVISIONS per span.
+# _MIN_DIVISIONS per span (but none shorter than a fortieth of it) and at most
+# _MAX_DIVISIONS. pycba's stability check reports a beam with a piece much
+# shorter than a 1000th of the characteristic length as a mechanism, so no
+# piece is shorter than a _MIN_LENGTH_RATIO-th of it.
 _PIECES_PER_LENGTH = 10
+_FINEST_PIECES_PER_LENGTH = 40
+_MIN_LENGTH_RATIO = 400
 _MIN_DIVISIONS = 16
 _MAX_DIVISIONS = 200
 _MIN_PIECE_POINTS = 25
 _MAX_CONTACT_ITERATIONS = 100
 # A moment load on a foundation span sits on a bare piece this fraction of a
-# piece long; a trapezoidal load on a foundation piece is this many steps.
+# piece long (and a contact edge is no nearer another node); a trapezoidal
+# load on a foundation piece is this many steps.
 _BARE_FRACTION = 20
 _TRAPEZOID_STEPS = 8
 
@@ -556,14 +562,41 @@ class CBAModel:
         iteration on the 'contact' spans (see 'analyze'), and returns the
         final BeamAnalysis of the divided beam, the mesh, and the foundation
         modulus used on each piece.
+
+        Once the contact has settled, a node is put where the beam's
+        deflection changes sign (the edge of the contact) and the contact is
+        settled again, until the edges stop moving: each piece is then wholly
+        in contact or wholly lifted, and the edge is where the deflection
+        says it is rather than at the nearest piece's end.
         """
-        moments = {}
+        moments: dict[int, list[float]] = {}
         for row in LM:
             if row[1] == 4 and int(row[0]) - 1 in divided:
                 span = int(row[0]) - 1
                 moments.setdefault(span, []).append(self.node_locations[span] + row[3])
-        mesh = _Mesh.divide(self, divided, contact, moments)
-        mesh_LM = mesh.split_loads(self, LM)
+        edges: dict[int, list[float]] = {}
+        for _ in range(_MAX_CONTACT_ITERATIONS):
+            mesh = _Mesh.divide(self, divided, contact, moments, edges)
+            beam_analysis, ks = self._settle_contact(mesh, mesh.split_loads(self, LM), check_stability)
+            if not contact:
+                return beam_analysis, mesh, ks
+            found = _contact_edges(beam_analysis, mesh, contact)
+            if _same_edges(found, edges, mesh, self):
+                return beam_analysis, mesh, ks
+            edges = found
+        raise RuntimeError(
+            "The edge of the foundation contact did not settle. Check the loads and supports."
+        )
+
+    def _settle_contact(
+        self, mesh: "_Mesh", mesh_LM: list[list], check_stability: bool
+    ) -> tuple[BeamAnalysis, list]:
+        """
+        Analyses the divided beam, switching each contact piece to 'kf' where
+        its middle presses down and to 'kf_tension' where it lifts, until no
+        piece changes. Returns the final BeamAnalysis and the modulus of each
+        piece.
+        """
         kf = self.kf or [None] * self.n_spans
         kt = self.kf_tension or [None] * self.n_spans
         down = [None if idx in mesh.bare else kf[p] for idx, p in enumerate(mesh.parent)]
@@ -577,7 +610,8 @@ class CBAModel:
             try:
                 beam_analysis.analyze(npts=npts, check_stability=check_stability)
             except ValueError as error:
-                if "unstable" not in str(error) and "singular" not in str(error):
+                lifted = any(k is None and d is not None for k, d in zip(ks, down))
+                if not lifted or ("unstable" not in str(error) and "singular" not in str(error)):
                     raise
                 raise ValueError(
                     "The beam lifts off its compression-only foundation and is not "
@@ -592,7 +626,7 @@ class CBAModel:
                 mid = 0.5 * (mesh.locations[idx] + mesh.locations[idx + 1])
                 new[idx] = down[idx] if np.interp(mid, s["x"], s["D"]) <= 0.0 else up[idx]
             if new == ks:
-                return beam_analysis, mesh, ks
+                return beam_analysis, ks
             key = tuple(new)
             if key in seen:
                 break  # Cycling between contact states.
@@ -958,27 +992,37 @@ class _Mesh:
         spans: list[int],
         contact: list[int] = (),
         moments: Optional[dict[int, list[float]]] = None,
+        edges: Optional[dict[int, list[float]]] = None,
     ) -> "_Mesh":
         """
         'model' with each of 'spans' divided by its foundation's characteristic
         length, plus a short bare piece around each of 'moments' (global
-        locations of moment loads, by span).
+        locations of moment loads, by span) and a node at each of 'edges'
+        (the edges of the foundation contact, by span) that is not within
+        a twentieth of a piece of another node.
         """
         X = model.node_locations
         moments = moments or {}
+        edges = edges or {}
         locations, parent, pieces, bare = [X[0]], [], [], set()
         for span in range(model.n_spans):
             x0, x1 = X[span], X[span + 1]
             points = [x1]
             if span in spans:
-                n = _divisions(model.L[span], model.EI[span], model.kf[span])
+                characteristic = _characteristic_length(model.EI[span], model.kf[span])
+                n = _divisions(model.L[span], characteristic)
                 points += np.linspace(x0, x1, n + 1)[1:-1].tolist()
-                half = 0.5 * model.L[span] / n / _BARE_FRACTION
+                piece = model.L[span] / n
+                half = 0.5 * min(max(piece / _BARE_FRACTION, characteristic / _MIN_LENGTH_RATIO), piece / 4)
                 bare_spans = []
                 for x in moments.get(span, []):
                     lo, hi = max(x - half, x0), min(x + half, x1)
                     bare_spans.append((lo, hi))
                     points += [lo, hi]
+                gap = 2.0 * half
+                for x in edges.get(span, []):
+                    if all(abs(x - p) > gap for p in points + [x0]):
+                        points.append(x)
                 # Inner points in order, none within the tolerance of another or
                 # of the span's ends, then the model's node itself, exactly.
                 tol = _TOL * model.L[span]
@@ -1106,11 +1150,54 @@ class _Mesh:
         return rows
 
 
-def _divisions(L: float, EI: float, kf: float) -> int:
-    """Pieces for a span on a foundation: about a tenth of its characteristic length each."""
-    characteristic = (4.0 * EI / kf) ** 0.25
+def _contact_edges(beam_analysis: BeamAnalysis, mesh: "_Mesh", contact: list[int]) -> dict[int, list[float]]:
+    """
+    Where the deflection changes sign along each of the 'contact' spans (the
+    edges of the foundation contact), interpolated between stations.
+    """
+    stations = _span_stations(beam_analysis)
+    edges = {}
+    for span in contact:
+        x = np.concatenate([stations[idx]["x"] for idx in mesh.children[span]])
+        d = np.concatenate([stations[idx]["D"] for idx in mesh.children[span]])
+        down = d <= 0.0
+        found = []
+        for k in np.nonzero(down[1:] != down[:-1])[0]:
+            if x[k + 1] > x[k]:
+                found.append(float(x[k] + (x[k + 1] - x[k]) * d[k] / (d[k] - d[k + 1])))
+        if found:
+            edges[span] = found
+    return edges
+
+
+def _same_edges(found: dict, edges: dict, mesh: "_Mesh", model: CBAModel) -> bool:
+    """True if the contact edges have moved by less than a thousandth of a piece."""
+    if found.keys() != edges.keys():
+        return False
+    for span, xs in found.items():
+        if len(xs) != len(edges[span]):
+            return False
+        tol = 1e-3 * model.L[span] / len(mesh.children[span])
+        if any(abs(a - b) > tol for a, b in zip(xs, edges[span])):
+            return False
+    return True
+
+
+def _characteristic_length(EI: float, kf: float) -> float:
+    """A beam on a foundation's characteristic length, (4 EI / kf) ** 0.25."""
+    return (4.0 * EI / kf) ** 0.25
+
+
+def _divisions(L: float, characteristic: float) -> int:
+    """
+    Pieces for a span on a foundation: about a tenth of its characteristic
+    length each, and at least _MIN_DIVISIONS of them unless that would make
+    them shorter than a fortieth of it (a short span is nearly rigid on its
+    foundation).
+    """
     n = int(np.ceil(_PIECES_PER_LENGTH * L / characteristic))
-    return min(max(n, _MIN_DIVISIONS), _MAX_DIVISIONS)
+    fewest = min(_MIN_DIVISIONS, int(np.ceil(_FINEST_PIECES_PER_LENGTH * L / characteristic)))
+    return min(max(n, fewest, 1), _MAX_DIVISIONS)
 
 
 # ----------------------------------------------------------------------

@@ -251,3 +251,27 @@ def test_old_models_load_as_linear():
     data = pt.dump_dict(beam())
     del data["kf_tension"]
     assert pt.load_dict(data).kf_tension is None
+
+
+def test_contact_edge_does_not_depend_on_the_pieces(monkeypatch):
+    """A node goes where the deflection changes sign, so the pieces' size hardly matters."""
+    import pycba_tools.model as model_module
+
+    tips = []
+    for per in (10, 15, 20, 30):
+        monkeypatch.setattr(model_module, "_PIECES_PER_LENGTH", per)
+        model = analysed(beam((6.0,), kf_tension=0.0), lambda m: m.add_point_load(60e3, 1.0, case="D"))
+        tips.append(model.nodes["N1"].DY["D"])
+    assert max(tips) - min(tips) < 1e-4 * abs(tips[0])
+
+
+def test_short_spans_with_a_moment_and_a_support():
+    """Short spans get fewer pieces rather than pieces too short for pycba's stability check."""
+    model = beam((0.3, 5.0, 0.4), kf_tension=0.0, supports=["free", "pin", "free", "free"])
+    model.add_moment_load(10e3, 0.15, case="D")
+    model.add_point_load(80e3, 4.0, case="D")
+    model.add_distributed_load(0.0, 10e3, 0.0, 5.7, case="D")
+    model.add_load_combo("D", {"D": 1.0})
+    model.analyze()
+    x, p = reaction(model, 4001)
+    assert np.trapezoid(p, x) + model.nodes["N1"].RxnFY["D"] == pytest.approx(80e3 + 0.5 * 10e3 * 5.7, rel=1e-4)
