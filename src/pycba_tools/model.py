@@ -47,6 +47,8 @@ from pycba.section import SectionEI
 from pycba.types import MemberType
 from pycba.utils import supports_to_R
 
+from ._recovery import exact_recovery
+
 DEFAULT_CASE = "Case 1"
 DEFAULT_COMBO = "Combo 1"
 
@@ -420,12 +422,12 @@ class CBAModel:
 
         Spans on a foundation ('kf') are analysed divided into pieces about
         a tenth of the foundation's characteristic length (4 EI / kf) ** 0.25
-        long. pycba recovers a foundation span's shear and moment from its
-        bending alone, sub-element by sub-element; on the shorter pieces that
-        approximation is much closer (a free end's moment comes out near zero,
-        as it should). The BeamAnalysis kept for such a combination is that of
-        the divided beam; the result views report the model's own nodes and
-        spans.
+        long, which carry the loads pycba's foundation spans cannot and let
+        the contact be followed (below). The BeamAnalysis kept for such a
+        combination is that of the divided beam; the result views report the
+        model's own nodes and spans. Their shear and moment include the
+        foundation's reaction along each sub-element, which pycba 1.0.2's own
+        recovery leaves out (see pycba_tools._recovery).
 
         A foundation whose stiffness in tension differs from its stiffness in
         compression ('kf_tension') is not linear, so each combination is
@@ -526,6 +528,7 @@ class CBAModel:
             )
         else:
             beam_analysis = BeamAnalysis(**mesh.beam_kwargs(self, kf), LM=[list(row) for row in LM])
+        exact_recovery(beam_analysis.beam)
         # Sample either side of concentrated loads so the shear (point load) and
         # moment (moment load) jumps are captured in the results
         shear_points: dict[int, list[float]] = {}
