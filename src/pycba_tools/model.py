@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 import numpy as np
+from numpy.polynomial import Polynomial
 from pycba import BeamAnalysis
 from pycba.load import factor_LM
 from pycba.section import SectionEI
@@ -53,6 +54,25 @@ DEFAULT_COMBO = "Combo 1"
 LOAD_ROW_LENGTHS = {1: (3,), 2: (4,), 3: (5,), 4: (4,), 5: (4, 6)}  # 6: >= 3
 
 _TOL = 1e-9
+
+# Divided foundation spans (see CBAModel.analyze): pieces about a tenth of the
+# foundation's characteristic length (4 EI / kf) ** 0.25, at least
+# _MIN_DIVISIONS per span (but none shorter than a fortieth of it) and at most
+# _MAX_DIVISIONS. pycba's stability check reports a beam with a piece much
+# shorter than a 1000th of the characteristic length as a mechanism, so no
+# piece is shorter than a _MIN_LENGTH_RATIO-th of it.
+_PIECES_PER_LENGTH = 10
+_FINEST_PIECES_PER_LENGTH = 40
+_MIN_LENGTH_RATIO = 400
+_MIN_DIVISIONS = 16
+_MAX_DIVISIONS = 200
+_MIN_PIECE_POINTS = 25
+_MAX_CONTACT_ITERATIONS = 100
+# A moment load on a foundation span sits on a bare piece this fraction of a
+# piece long (and a contact edge is no nearer another node); a trapezoidal
+# load on a foundation piece is this many steps.
+_BARE_FRACTION = 20
+_TRAPEZOID_STEPS = 8
 
 
 @dataclass
@@ -101,7 +121,16 @@ class CBAModel:
     GAv : float or sequence, optional
         Shear rigidity per span (Timoshenko spans). Default is None.
     kf : float or sequence, optional
-        Winkler foundation modulus per span. Default is None.
+        Winkler foundation modulus per span (force per length, per length of
+        beam): the stiffness in compression, as the beam presses down. Default
+        is None (no foundation).
+    kf_tension : float or sequence, optional
+        The foundation's stiffness in tension, as the beam lifts, per span.
+        None (the default, or for a span) is the same as 'kf': a linear
+        foundation, as pycba models it. 0 is a compression-only foundation
+        that the beam lifts off; another value is a bilinear one. A span whose
+        'kf_tension' differs from its 'kf' is analysed by contact iteration
+        (see 'analyze').
     name : str
         The name of the (physical) member, used as the member key in result
         trees. Default is "M1".
@@ -127,6 +156,7 @@ class CBAModel:
         D: Optional[Sequence[Optional[float]]] = None,
         GAv: Optional[float | Sequence[Optional[float]]] = None,
         kf: Optional[float | Sequence[Optional[float]]] = None,
+        kf_tension: Optional[float | Sequence[Optional[float]]] = None,
         name: str = "M1",
         node_names: Optional[Sequence[str]] = None,
         node_locations: Optional[Sequence[float]] = None,
@@ -156,6 +186,21 @@ class CBAModel:
         self.kf: Optional[list[Optional[float]]] = (
             None if kf is None else _per_span(kf, n_spans, "kf")
         )
+        self.kf_tension: Optional[list[Optional[float]]] = (
+            None if kf_tension is None else _per_span(kf_tension, n_spans, "kf_tension")
+        )
+        if self.kf_tension is not None:
+            for span, (k, kt) in enumerate(zip(self.kf or [None] * n_spans, self.kf_tension)):
+                if kt is None:
+                    continue
+                if kt < 0:
+                    raise ValueError(
+                        f"'kf_tension' is a stiffness and cannot be negative (span {span}: {kt})."
+                    )
+                if k is None:
+                    raise ValueError(
+                        f"Span {span} has a 'kf_tension' but no foundation ('kf' is None)."
+                    )
 
         if (R is None) == (supports is None):
             raise ValueError("Provide exactly one of 'R' or 'supports'.")
@@ -199,6 +244,9 @@ class CBAModel:
         self.analyses: dict[str, BeamAnalysis] = {}
         self._stations: dict[str, list[dict[str, np.ndarray]]] = {}
         self._reactions: dict[str, np.ndarray] = {}
+        self._displacements: dict[str, np.ndarray] = {}
+        self._foundation: dict[str, list[tuple[float, float, float]]] = {}
+        self._nonlinear = False
         self._nodes: Optional[dict[str, "NodeView"]] = None
         self._members: Optional[dict[str, "MemberView"]] = None
 
@@ -369,26 +417,61 @@ class CBAModel:
         The pycba BeamAnalysis of each combination is kept in
         'self.analyses[combo_name]' for use with pycba's own tools (plotting,
         dataframes, etc.).
+
+        Spans on a foundation ('kf') are analysed divided into pieces about
+        a tenth of the foundation's characteristic length (4 EI / kf) ** 0.25
+        long. pycba recovers a foundation span's shear and moment from its
+        bending alone, sub-element by sub-element; on the shorter pieces that
+        approximation is much closer (a free end's moment comes out near zero,
+        as it should). The BeamAnalysis kept for such a combination is that of
+        the divided beam; the result views report the model's own nodes and
+        spans.
+
+        A foundation whose stiffness in tension differs from its stiffness in
+        compression ('kf_tension') is not linear, so each combination is
+        analysed on its own by contact iteration: each piece takes 'kf' where
+        the beam presses down and 'kf_tension' where it lifts, and the beam is
+        analysed again until no piece changes.
+
+        pycba's foundation spans take only UDL, point and partial-UDL loads.
+        On the divided beam, a moment load is carried by a piece a twentieth
+        of a piece long with no foundation under it, and a trapezoidal load
+        becomes steps of partial UDLs, which carry the same total load.
         """
         if npts is not None:
             self.npts = int(npts)
         if not self.load_combos:
             self.add_load_combo(DEFAULT_COMBO, {DEFAULT_CASE: 1.0})
         self._reset_results()
+        contact = self._contact_spans()
+        divided = self._foundation_spans()
+        self._nonlinear = bool(contact)
         for combo_name in self.load_combos:
-            beam_analysis = self._beam_analysis(self.combined_loads(combo_name))
-            beam_analysis.analyze(npts=self.npts, check_stability=check_stability)
+            LM = self.combined_loads(combo_name)
+            if divided:
+                beam_analysis, mesh, ks = self._analyze_divided(
+                    LM, contact, divided, check_stability
+                )
+            else:
+                beam_analysis = self._beam_analysis(LM)
+                beam_analysis.analyze(npts=self.npts, check_stability=check_stability)
+                mesh = _Mesh.unsplit(self)
+                ks = list(self.kf) if self.kf is not None else [None] * self.n_spans
             self.analyses[combo_name] = beam_analysis
-            self._stations[combo_name] = _span_stations(beam_analysis)
-            self._reactions[combo_name] = _full_reactions(beam_analysis)
+            self._store_results(combo_name, beam_analysis, mesh, ks)
 
     # Aliases matching FEModel3D's analysis methods
     analyze_linear = analyze
 
     @property
     def solution(self) -> Optional[str]:
-        """'Linear' once the model is analysed, otherwise None (as in Pynite)."""
-        return "Linear" if self.analyses else None
+        """
+        'Linear' once the model is analysed ('Nonlinear' if it needed contact
+        iteration), otherwise None (as in Pynite).
+        """
+        if not self.analyses:
+            return None
+        return "Nonlinear" if self._nonlinear else "Linear"
 
     # ------------------------------------------------------------------
     # Pynite-shaped result views
@@ -418,18 +501,31 @@ class CBAModel:
         self.analyses = {}
         self._stations = {}
         self._reactions = {}
+        self._displacements = {}
+        self._foundation = {}
+        self._nonlinear = False
 
-    def _beam_analysis(self, LM: list[list]) -> BeamAnalysis:
-        beam_analysis = BeamAnalysis(
-            L=list(self.L),
-            EI=list(self.EI),
-            R=list(self.R),
-            LM=[list(row) for row in LM],
-            eletype=list(self.eletype),
-            D=list(self.D),
-            GAv=None if self.GAv is None else list(self.GAv),
-            kf=None if self.kf is None else list(self.kf),
-        )
+    def _beam_analysis(
+        self, LM: list[list], mesh: Optional["_Mesh"] = None, kf: Optional[list] = None
+    ) -> BeamAnalysis:
+        """
+        A pycba BeamAnalysis of load matrix 'LM' on the model's beam or, with
+        'mesh', on the divided beam (whose loads 'LM' already are), with the
+        foundation moduli 'kf' per divided span.
+        """
+        if mesh is None:
+            beam_analysis = BeamAnalysis(
+                L=list(self.L),
+                EI=list(self.EI),
+                R=list(self.R),
+                LM=[list(row) for row in LM],
+                eletype=list(self.eletype),
+                D=list(self.D),
+                GAv=None if self.GAv is None else list(self.GAv),
+                kf=None if self.kf is None else list(self.kf),
+            )
+        else:
+            beam_analysis = BeamAnalysis(**mesh.beam_kwargs(self, kf), LM=[list(row) for row in LM])
         # Sample either side of concentrated loads so the shear (point load) and
         # moment (moment load) jumps are captured in the results
         shear_points: dict[int, list[float]] = {}
@@ -441,6 +537,125 @@ class CBAModel:
                 span: np.unique(points) for span, points in shear_points.items()
             }
         return beam_analysis
+
+    def _contact_spans(self) -> list[int]:
+        """The spans on a foundation whose stiffness in tension differs from 'kf'."""
+        if self.kf is None or self.kf_tension is None:
+            return []
+        return [
+            span
+            for span, (k, kt) in enumerate(zip(self.kf, self.kf_tension))
+            if k is not None and kt is not None and kt != k
+        ]
+
+    def _foundation_spans(self) -> list[int]:
+        """The spans on a foundation, which are analysed divided (see 'analyze')."""
+        if self.kf is None:
+            return []
+        return [span for span, k in enumerate(self.kf) if k is not None]
+
+    def _analyze_divided(
+        self, LM: list[list], contact: list[int], divided: list[int], check_stability: bool
+    ) -> tuple[BeamAnalysis, "_Mesh", list]:
+        """
+        Analyses load matrix 'LM' on the beam with spans 'divided', by contact
+        iteration on the 'contact' spans (see 'analyze'), and returns the
+        final BeamAnalysis of the divided beam, the mesh, and the foundation
+        modulus used on each piece.
+
+        Once the contact has settled, a node is put where the beam's
+        deflection changes sign (the edge of the contact) and the contact is
+        settled again, until the edges stop moving: each piece is then wholly
+        in contact or wholly lifted, and the edge is where the deflection
+        says it is rather than at the nearest piece's end.
+        """
+        moments: dict[int, list[float]] = {}
+        for row in LM:
+            if row[1] == 4 and int(row[0]) - 1 in divided:
+                span = int(row[0]) - 1
+                moments.setdefault(span, []).append(self.node_locations[span] + row[3])
+        edges: dict[int, list[float]] = {}
+        for _ in range(_MAX_CONTACT_ITERATIONS):
+            mesh = _Mesh.divide(self, divided, contact, moments, edges)
+            beam_analysis, ks = self._settle_contact(mesh, mesh.split_loads(self, LM), check_stability)
+            if not contact:
+                return beam_analysis, mesh, ks
+            found = _contact_edges(beam_analysis, mesh, contact)
+            if _same_edges(found, edges, mesh, self):
+                return beam_analysis, mesh, ks
+            edges = found
+        raise RuntimeError(
+            "The edge of the foundation contact did not settle. Check the loads and supports."
+        )
+
+    def _settle_contact(
+        self, mesh: "_Mesh", mesh_LM: list[list], check_stability: bool
+    ) -> tuple[BeamAnalysis, list]:
+        """
+        Analyses the divided beam, switching each contact piece to 'kf' where
+        its middle presses down and to 'kf_tension' where it lifts, until no
+        piece changes. Returns the final BeamAnalysis and the modulus of each
+        piece.
+        """
+        kf = self.kf or [None] * self.n_spans
+        kt = self.kf_tension or [None] * self.n_spans
+        down = [None if idx in mesh.bare else kf[p] for idx, p in enumerate(mesh.parent)]
+        up = [kt[p] if kt[p] is not None else kf[p] for p in mesh.parent]
+        up = [None if k == 0.0 or idx in mesh.bare else k for idx, k in enumerate(up)]
+        ks = list(down)  # Start in contact everywhere.
+        npts = max(int(np.ceil(self.npts / mesh.max_divisions)), _MIN_PIECE_POINTS)
+        seen = set()
+        for _ in range(_MAX_CONTACT_ITERATIONS):
+            beam_analysis = self._beam_analysis(mesh_LM, mesh, ks)
+            try:
+                beam_analysis.analyze(npts=npts, check_stability=check_stability)
+            except ValueError as error:
+                lifted = any(k is None and d is not None for k, d in zip(ks, down))
+                if not lifted or ("unstable" not in str(error) and "singular" not in str(error)):
+                    raise
+                raise ValueError(
+                    "The beam lifts off its compression-only foundation and is not "
+                    "otherwise supported enough to be stable: the loads would lift it "
+                    "away. Add supports, or give the foundation a stiffness in tension "
+                    "('kf_tension')."
+                ) from error
+            stations = _span_stations(beam_analysis)
+            new = list(ks)
+            for idx in mesh.pieces:
+                s = stations[idx]
+                mid = 0.5 * (mesh.locations[idx] + mesh.locations[idx + 1])
+                new[idx] = down[idx] if np.interp(mid, s["x"], s["D"]) <= 0.0 else up[idx]
+            if new == ks:
+                return beam_analysis, ks
+            key = tuple(new)
+            if key in seen:
+                break  # Cycling between contact states.
+            seen.add(key)
+            ks = new
+        raise RuntimeError(
+            "The foundation contact did not settle: the beam keeps switching between "
+            "pieces in and out of contact. Check the loads and supports."
+        )
+
+    def _store_results(
+        self, combo_name: str, beam_analysis: BeamAnalysis, mesh: "_Mesh", ks: list
+    ) -> None:
+        """Keeps a combination's results on the model's own nodes and spans."""
+        stations = _span_stations(beam_analysis)
+        by_span = []
+        for span in range(self.n_spans):
+            pieces = [stations[idx] for idx in mesh.children[span]]
+            by_span.append(
+                {key: np.concatenate([p[key] for p in pieces]) for key in pieces[0]}
+            )
+        self._stations[combo_name] = by_span
+        dofs = [2 * node + dof for node in mesh.node_map for dof in (0, 1)]
+        self._reactions[combo_name] = _full_reactions(beam_analysis)[dofs]
+        self._displacements[combo_name] = np.asarray(beam_analysis.beam_results.D, dtype=float)[dofs]
+        self._foundation[combo_name] = [
+            (mesh.locations[idx], mesh.locations[idx + 1], 0.0 if k is None else float(k))
+            for idx, k in enumerate(ks)
+        ]
 
     def _check_within(self, x: float) -> None:
         X = self.node_locations
@@ -534,8 +749,8 @@ class NodeView:
 
     def _displacements(self, dof: int) -> dict[str, float]:
         return {
-            combo: float(beam_analysis.beam_results.D[2 * self.index + dof])
-            for combo, beam_analysis in self.model.analyses.items()
+            combo: float(displacements[2 * self.index + dof])
+            for combo, displacements in self.model._displacements.items()
         }
 
     def _zeros(self) -> dict[str, float]:
@@ -613,6 +828,25 @@ class _SegmentView:
             x_array = np.linspace(0, self.L(), n_points)
         x_array = np.asarray(x_array, dtype=float)
         return np.array([x_array, self._values(action, x_array, combo_name)])
+
+    # --- Foundation -------------------------------------------------------
+
+    def foundation_reaction_array(
+        self, n_points: int, combo_name: str = DEFAULT_COMBO, x_array=None
+    ) -> np.ndarray:
+        """
+        The foundation's reaction on the beam, force per length (up
+        positive), as [x, reaction] like the other result arrays: the
+        foundation modulus in use times the beam's deflection. Zero where the
+        beam has no foundation or has lifted off a compression-only one.
+        """
+        x, dy = self._array("dy", n_points, combo_name, x_array)
+        x_global = x + self.model.node_locations[self.i_index]
+        pieces = self.model._foundation[combo_name]
+        starts = np.array([p[0] for p in pieces])
+        ks = np.array([p[2] for p in pieces])
+        idx = np.clip(np.searchsorted(starts, x_global, side="right") - 1, 0, len(pieces) - 1)
+        return np.array([x, -ks[idx] * dy])
 
     # --- Pynite Member3D/PhysMember3D API -----------------------------------
 
@@ -711,6 +945,259 @@ class MemberView(_SegmentView):
 
     def __repr__(self) -> str:
         return f"MemberView({self.name!r}, L={self.L()})"
+
+
+# ----------------------------------------------------------------------
+# Divided beam for contact iteration
+# ----------------------------------------------------------------------
+
+
+class _Mesh:
+    """
+    The model's beam with some spans divided into pieces (see
+    CBAModel.analyze): the pieces' node locations, which model span each
+    piece belongs to, and where the model's nodes are among the divided
+    beam's nodes.
+    """
+
+    def __init__(
+        self,
+        locations: list[float],
+        parent: list[int],
+        pieces: list[int],
+        bare: frozenset = frozenset(),
+        founded: frozenset = frozenset(),
+    ):
+        self.locations = locations
+        self.parent = parent
+        self.pieces = pieces  # The pieces whose contact is iterated.
+        self.bare = bare  # The pieces under a moment load, with no foundation.
+        self.founded = founded  # The model spans on a foundation.
+        n_spans = max(parent) + 1
+        self.children: list[list[int]] = [[] for _ in range(n_spans)]
+        for idx, span in enumerate(parent):
+            self.children[span].append(idx)
+        # A model span's first piece starts at the model's node.
+        self.node_map = [kids[0] for kids in self.children] + [len(parent)]
+        self.max_divisions = max(len(kids) for kids in self.children)
+
+    @classmethod
+    def unsplit(cls, model: CBAModel) -> "_Mesh":
+        return cls(list(model.node_locations), list(range(model.n_spans)), [])
+
+    @classmethod
+    def divide(
+        cls,
+        model: CBAModel,
+        spans: list[int],
+        contact: list[int] = (),
+        moments: Optional[dict[int, list[float]]] = None,
+        edges: Optional[dict[int, list[float]]] = None,
+    ) -> "_Mesh":
+        """
+        'model' with each of 'spans' divided by its foundation's characteristic
+        length, plus a short bare piece around each of 'moments' (global
+        locations of moment loads, by span) and a node at each of 'edges'
+        (the edges of the foundation contact, by span) that is not within
+        a twentieth of a piece of another node.
+        """
+        X = model.node_locations
+        moments = moments or {}
+        edges = edges or {}
+        locations, parent, pieces, bare = [X[0]], [], [], set()
+        for span in range(model.n_spans):
+            x0, x1 = X[span], X[span + 1]
+            points = [x1]
+            if span in spans:
+                characteristic = _characteristic_length(model.EI[span], model.kf[span])
+                n = _divisions(model.L[span], characteristic)
+                points += np.linspace(x0, x1, n + 1)[1:-1].tolist()
+                piece = model.L[span] / n
+                half = 0.5 * min(max(piece / _BARE_FRACTION, characteristic / _MIN_LENGTH_RATIO), piece / 4)
+                bare_spans = []
+                for x in moments.get(span, []):
+                    lo, hi = max(x - half, x0), min(x + half, x1)
+                    bare_spans.append((lo, hi))
+                    points += [lo, hi]
+                gap = 2.0 * half
+                for x in edges.get(span, []):
+                    if all(abs(x - p) > gap for p in points + [x0]):
+                        points.append(x)
+                # Inner points in order, none within the tolerance of another or
+                # of the span's ends, then the model's node itself, exactly.
+                tol = _TOL * model.L[span]
+                inner = []
+                for p in sorted(p for p in points if x0 + tol < p < x1 - tol):
+                    if not inner or p - inner[-1] > tol:
+                        inner.append(p)
+                points = inner + [x1]
+            start = x0
+            for x in points:
+                idx = len(parent)
+                if span in contact:
+                    pieces.append(idx)
+                if span in spans and any(
+                    lo - _TOL <= start and x <= hi + _TOL for lo, hi in bare_spans
+                ):
+                    bare.add(idx)
+                parent.append(span)
+                locations.append(x)
+                start = x
+        bare_set = frozenset(bare)
+        pieces = [idx for idx in pieces if idx not in bare_set]
+        founded = frozenset(
+            span for span in range(model.n_spans) if model.kf is not None and model.kf[span] is not None
+        )
+        return cls(locations, parent, pieces, bare_set, founded)
+
+    def beam_kwargs(self, model: CBAModel, kf: list) -> dict:
+        """BeamAnalysis arguments for the divided beam with foundation moduli 'kf'."""
+        model_node = {node: idx for idx, node in enumerate(self.node_map)}
+        R, D = [], []
+        for node in range(len(self.locations)):
+            if node in model_node:
+                j = model_node[node]
+                R += model.R[2 * j : 2 * j + 2]
+                D += model.D[2 * j : 2 * j + 2]
+            else:
+                R += [0.0, 0.0]
+                D += [None, None]
+        eletype = []
+        for idx, span in enumerate(self.parent):
+            e = model.eletype[span]
+            kids = self.children[span]
+            i_released = e in (MemberType.PF, MemberType.PP) and idx == kids[0]
+            j_released = e in (MemberType.FP, MemberType.PP) and idx == kids[-1]
+            eletype.append(
+                {(False, False): 1, (False, True): 2, (True, False): 3, (True, True): 4}[
+                    (i_released, j_released)
+                ]
+            )
+        return dict(
+            L=list(np.diff(self.locations)),
+            EI=[model.EI[span] for span in self.parent],
+            R=R,
+            eletype=eletype,
+            D=D,
+            GAv=None if model.GAv is None else [model.GAv[span] for span in self.parent],
+            kf=list(kf),
+        )
+
+    def _piece_at(self, span: int, x: float) -> int:
+        """The piece of model span 'span' at global 'x'; a shared node belongs to the left piece."""
+        kids = self.children[span]
+        bounds = self.locations[kids[0] : kids[-1] + 2]
+        k = int(np.searchsorted(bounds, x, side="left")) - 1
+        return kids[min(max(k, 0), len(kids) - 1)]
+
+    def split_loads(self, model: CBAModel, LM: list[list]) -> list[list]:
+        """The pycba load matrix 'LM' of the model's beam, on the divided beam."""
+        X = model.node_locations
+        out = []
+        for row in LM:
+            span, load_type = int(row[0]) - 1, int(row[1])
+            kids = self.children[span]
+            if len(kids) == 1:
+                out.append([kids[0] + 1] + list(row[1:]))
+                continue
+            x0 = X[span]
+            if load_type in (2, 4):  # Point load, moment
+                x = x0 + row[3]
+                idx = self._piece_at(span, x)
+                out.append([idx + 1, load_type, row[2], x - self.locations[idx]])
+            elif load_type == 6:  # Imposed curvature: shift the polynomial to each piece
+                coefs = np.asarray(row[2:], dtype=float)
+                for idx in kids:
+                    shifted = Polynomial(coefs)(Polynomial([self.locations[idx] - x0, 1.0])).coef
+                    shifted = np.pad(shifted, (0, len(coefs) - len(shifted)))
+                    out.append([idx + 1, 6] + shifted.tolist())
+            else:  # Distributed: 1 UDL, 3 partial UDL, 5 trapezoidal
+                if load_type == 1:
+                    w1 = w2 = row[2]
+                    a, c = 0.0, model.L[span]
+                elif load_type == 3:
+                    w1 = w2 = row[2]
+                    a, c = row[3], row[4]
+                else:
+                    w1, w2 = row[2], row[3]
+                    a = row[4] if len(row) > 4 else 0.0
+                    c = row[5] if len(row) > 5 else model.L[span] - a
+                out += self._split_line(span, w1, w2, x0 + a, x0 + a + c)
+        return out
+
+    def _split_line(self, span: int, w1: float, w2: float, g1: float, g2: float) -> list[list]:
+        rows = []
+        for idx in self.children[span]:
+            s0, s1 = self.locations[idx], self.locations[idx + 1]
+            start, end = max(g1, s0), min(g2, s1)
+            if end - start <= _TOL:
+                continue
+            wa, wb = (w1 + (w2 - w1) * (x - g1) / (g2 - g1) for x in (start, end))
+            a, c = start - s0, end - start
+            full = abs(a) <= _TOL and abs(c - (s1 - s0)) <= _TOL
+            if wa != wb and span in self.founded and idx not in self.bare:
+                # pycba's foundation pieces take no trapezoidal load: steps of
+                # partial UDLs at the mean intensity of each step.
+                edges = np.linspace(a, a + c, _TRAPEZOID_STEPS + 1)
+                for t0, t1 in zip(edges, edges[1:]):
+                    w = wa + (wb - wa) * (0.5 * (t0 + t1) - a) / c
+                    rows.append([idx + 1, 3, w, t0, t1 - t0])
+                continue
+            if wa == wb:
+                rows.append([idx + 1, 1, wa] if full else [idx + 1, 3, wa, a, c])
+            else:
+                rows.append([idx + 1, 5, wa, wb] if full else [idx + 1, 5, wa, wb, a, c])
+        return rows
+
+
+def _contact_edges(beam_analysis: BeamAnalysis, mesh: "_Mesh", contact: list[int]) -> dict[int, list[float]]:
+    """
+    Where the deflection changes sign along each of the 'contact' spans (the
+    edges of the foundation contact), interpolated between stations.
+    """
+    stations = _span_stations(beam_analysis)
+    edges = {}
+    for span in contact:
+        x = np.concatenate([stations[idx]["x"] for idx in mesh.children[span]])
+        d = np.concatenate([stations[idx]["D"] for idx in mesh.children[span]])
+        down = d <= 0.0
+        found = []
+        for k in np.nonzero(down[1:] != down[:-1])[0]:
+            if x[k + 1] > x[k]:
+                found.append(float(x[k] + (x[k + 1] - x[k]) * d[k] / (d[k] - d[k + 1])))
+        if found:
+            edges[span] = found
+    return edges
+
+
+def _same_edges(found: dict, edges: dict, mesh: "_Mesh", model: CBAModel) -> bool:
+    """True if the contact edges have moved by less than a thousandth of a piece."""
+    if found.keys() != edges.keys():
+        return False
+    for span, xs in found.items():
+        if len(xs) != len(edges[span]):
+            return False
+        tol = 1e-3 * model.L[span] / len(mesh.children[span])
+        if any(abs(a - b) > tol for a, b in zip(xs, edges[span])):
+            return False
+    return True
+
+
+def _characteristic_length(EI: float, kf: float) -> float:
+    """A beam on a foundation's characteristic length, (4 EI / kf) ** 0.25."""
+    return (4.0 * EI / kf) ** 0.25
+
+
+def _divisions(L: float, characteristic: float) -> int:
+    """
+    Pieces for a span on a foundation: about a tenth of its characteristic
+    length each, and at least _MIN_DIVISIONS of them unless that would make
+    them shorter than a fortieth of it (a short span is nearly rigid on its
+    foundation).
+    """
+    n = int(np.ceil(_PIECES_PER_LENGTH * L / characteristic))
+    fewest = min(_MIN_DIVISIONS, int(np.ceil(_FINEST_PIECES_PER_LENGTH * L / characteristic)))
+    return min(max(n, fewest, 1), _MAX_DIVISIONS)
 
 
 # ----------------------------------------------------------------------
