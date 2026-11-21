@@ -226,7 +226,7 @@ and the package and version that wrote it:
   "library": "pycba",
   "library_version": "1.0.2",
   "generator": "pycba-tools",
-  "generator_version": "0.3.0"
+  "generator_version": "0.3.1"
 }
 ```
 

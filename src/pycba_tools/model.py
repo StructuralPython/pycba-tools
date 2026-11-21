@@ -577,9 +577,14 @@ class CBAModel:
             if row[1] == 4 and int(row[0]) - 1 in divided:
                 span = int(row[0]) - 1
                 moments.setdefault(span, []).append(self.node_locations[span] + row[3])
+        point_loads: dict[int, list[float]] = {}
+        for row in LM:
+            if row[1] == 2 and int(row[0]) - 1 in divided:
+                span = int(row[0]) - 1
+                point_loads.setdefault(span, []).append(self.node_locations[span] + row[3])
         edges: dict[int, list[float]] = {}
         for _ in range(_MAX_CONTACT_ITERATIONS):
-            mesh = _Mesh.divide(self, divided, contact, moments, edges)
+            mesh = _Mesh.divide(self, divided, contact, moments, edges, point_loads)
             beam_analysis, ks = self._settle_contact(mesh, mesh.split_loads(self, LM), check_stability)
             if not contact:
                 return beam_analysis, mesh, ks
@@ -996,17 +1001,23 @@ class _Mesh:
         contact: list[int] = (),
         moments: Optional[dict[int, list[float]]] = None,
         edges: Optional[dict[int, list[float]]] = None,
+        point_loads: Optional[dict[int, list[float]]] = None,
     ) -> "_Mesh":
         """
         'model' with each of 'spans' divided by its foundation's characteristic
         length, plus a short bare piece around each of 'moments' (global
         locations of moment loads, by span) and a node at each of 'edges'
         (the edges of the foundation contact, by span) that is not within
-        a twentieth of a piece of another node.
+        a twentieth of a piece of another node. A node goes at each of
+        'point_loads' (by span), moving the nearest grid point onto it if that
+        is closer than a twentieth of a piece: pycba samples a foundation
+        piece evenly, so a point load's jump in shear is sampled exactly only
+        at a piece's end.
         """
         X = model.node_locations
         moments = moments or {}
         edges = edges or {}
+        point_loads = point_loads or {}
         locations, parent, pieces, bare = [X[0]], [], [], set()
         for span in range(model.n_spans):
             x0, x1 = X[span], X[span + 1]
@@ -1023,6 +1034,15 @@ class _Mesh:
                     bare_spans.append((lo, hi))
                     points += [lo, hi]
                 gap = 2.0 * half
+                for x in point_loads.get(span, []):
+                    if not x0 + gap < x < x1 - gap:
+                        continue  # At (or next to) the model's node: already a piece end.
+                    grid = range(1, n)  # The even grid's inner points (not a moment's bare piece).
+                    near = min(grid, key=lambda i: abs(points[i] - x), default=None)
+                    if near is not None and abs(points[near] - x) <= gap:
+                        points[near] = x
+                    else:
+                        points.append(x)
                 for x in edges.get(span, []):
                     if all(abs(x - p) > gap for p in points + [x0]):
                         points.append(x)
