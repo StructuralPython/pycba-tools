@@ -10,7 +10,7 @@ Modules included:
 - combos: Functions for bulk importing load combinations
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from .model import CBAModel, LoadCombo
 

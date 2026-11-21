@@ -332,3 +332,18 @@ def test_a_point_load_on_a_foundation_jumps_at_its_location():
     member = model.members["beam"]
     jump = member.shear("Fy", 1.2 - 1e-6, "D") - member.shear("Fy", 1.2 + 1e-6, "D")
     assert jump == pytest.approx(400e3, rel=1e-6)
+
+
+@pytest.mark.parametrize("x", [0.8, 1.2, 3.8, 6.8])
+def test_the_shear_jump_is_on_the_right_side_of_a_load(x):
+    """Wherever a point load falls, the shear just left of it is before the jump."""
+    model = pt.CBAModel(L=[14.0], EI=9e9, supports=["free", "free"], kf=5e7, kf_tension=0.0, name="beam")
+    model.add_point_load(1500e3, x, case="D")
+    model.add_point_load(1500e3, 14.0 - x, case="D")
+    model.add_load_combo("D", {"D": 1.0})
+    model.analyze()
+    member = model.members["beam"]
+    before = member.shear("Fy", x - 1e-5, "D")
+    after = member.shear("Fy", x + 1e-5, "D")
+    assert before > 0 and after < 0  # The soil left of the load pushes up; past it the load wins.
+    assert before - after == pytest.approx(1500e3, rel=1e-4)
