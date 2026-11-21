@@ -585,7 +585,8 @@ class CBAModel:
         edges: dict[int, list[float]] = {}
         for _ in range(_MAX_CONTACT_ITERATIONS):
             mesh = _Mesh.divide(self, divided, contact, moments, edges, point_loads)
-            beam_analysis, ks = self._settle_contact(mesh, mesh.split_loads(self, LM), check_stability)
+            mesh.loads = mesh.split_loads(self, LM)
+            beam_analysis, ks = self._settle_contact(mesh, mesh.loads, check_stability)
             if not contact:
                 return beam_analysis, mesh, ks
             found = _contact_edges(beam_analysis, mesh, contact)
@@ -650,6 +651,15 @@ class CBAModel:
     ) -> None:
         """Keeps a combination's results on the model's own nodes and spans."""
         stations = _span_stations(beam_analysis)
+        # A point load on the node between two pieces is at the start of the
+        # right-hand piece (see _Mesh.split_loads). pycba carries it in that
+        # piece's end forces, so the piece's first station still shows the
+        # shear from before the load; the load is taken off it there.
+        for row in mesh.loads or []:
+            if row[1] == 2 and row[3] == 0.0:
+                s = stations[int(row[0]) - 1]
+                s["V"] = s["V"].copy()
+                s["V"][0] -= row[2]
         by_span = []
         for span in range(self.n_spans):
             pieces = [stations[idx] for idx in mesh.children[span]]
@@ -979,6 +989,7 @@ class _Mesh:
         self.locations = locations
         self.parent = parent
         self.pieces = pieces  # The pieces whose contact is iterated.
+        self.loads: Optional[list[list]] = None  # The load matrix on the pieces, once split.
         self.bare = bare  # The pieces under a moment load, with no foundation.
         self.founded = founded  # The model spans on a foundation.
         n_spans = max(parent) + 1
@@ -1127,7 +1138,16 @@ class _Mesh:
             if load_type in (2, 4):  # Point load, moment
                 x = x0 + row[3]
                 idx = self._piece_at(span, x)
-                out.append([idx + 1, load_type, row[2], x - self.locations[idx]])
+                a = x - self.locations[idx]
+                # A load on the node between two pieces goes at the start of
+                # the right-hand piece, where pycba applies it from the first
+                # station on. At the end of the left-hand piece, round-off can
+                # put it just short of the end, so that the left piece's last
+                # station already shows the jump.
+                tol = _TOL * model.L[span]
+                if idx != kids[-1] and abs(x - self.locations[idx + 1]) <= tol:
+                    idx, a = idx + 1, 0.0
+                out.append([idx + 1, load_type, row[2], a])
             elif load_type == 6:  # Imposed curvature: shift the polynomial to each piece
                 coefs = np.asarray(row[2:], dtype=float)
                 for idx in kids:
