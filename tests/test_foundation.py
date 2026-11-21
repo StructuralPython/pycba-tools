@@ -320,3 +320,15 @@ def test_short_spans_with_a_moment_and_a_support():
     model.analyze()
     x, p = reaction(model, 4001)
     assert np.trapezoid(p, x) + model.nodes["N1"].RxnFY["D"] == pytest.approx(80e3 + 0.5 * 10e3 * 5.7, rel=1e-4)
+
+
+def test_a_point_load_on_a_foundation_jumps_at_its_location():
+    """A node goes under each point load, so the shear jumps exactly there."""
+    model = pt.CBAModel(L=[6.0], EI=225e6, supports=["free", "free"], kf=KF, kf_tension=0.0, name="beam")
+    model.add_point_load(400e3, 1.2, case="D")
+    model.add_distributed_load(10e3, 30e3, 2.0, 6.0, case="D")
+    model.add_load_combo("D", {"D": 1.0})
+    model.analyze()
+    member = model.members["beam"]
+    jump = member.shear("Fy", 1.2 - 1e-6, "D") - member.shear("Fy", 1.2 + 1e-6, "D")
+    assert jump == pytest.approx(400e3, rel=1e-6)
