@@ -347,3 +347,50 @@ def test_the_shear_jump_is_on_the_right_side_of_a_load(x):
     after = member.shear("Fy", x + 1e-5, "D")
     assert before > 0 and after < 0  # The soil left of the load pushes up; past it the load wins.
     assert before - after == pytest.approx(1500e3, rel=1e-4)
+
+
+def raft_strip() -> pt.CBAModel:
+    """
+    A raft strip wholly in contact: 18.2 m, 600 mm deep, 7.8 m wide on 5 MPa/m,
+    with column loads as beamz9000 passes them (11.7 m from 11700 mm).
+    """
+    model = pt.CBAModel(
+        L=[18.2],
+        EI=26622e6 * 7.8 * 0.6**3 / 12,
+        supports=["free", "free"],
+        kf=5e6 * 7.8,
+        kf_tension=0.0,
+        name="beam",
+    )
+    for case, (edge, inner) in {"D": (1000e3, 1875e3), "L": (700e3, 1550e3), "S": (150e3, 300e3)}.items():
+        for p, x in ((edge, 0.0), (inner, 6.5), (inner, 11.700000000000001), (edge, 18.2)):
+            model.add_point_load(p, x, case=case)
+        model.add_load_combo(case, {case: 1.0})
+    return model
+
+
+def test_a_beam_wholly_in_contact_settles():
+    """
+    The pads pycba leaves between a foundation's sub-elements read zero
+    deflection (or +1e-10 of noise) and used to look like edges of the
+    contact that came and went, so the contact never settled.
+    """
+    model = raft_strip()
+    model.analyze()
+    x = np.linspace(0, 18.2, 365)
+    for combo, total in (("D", 5750e3), ("L", 4500e3), ("S", 900e3)):
+        assert (curve(model, "dy", x, combo) < 0).all()
+        xr, p = reaction(model, combo=combo)
+        assert np.trapezoid(p, xr) == pytest.approx(total, rel=1e-4)
+
+
+def test_no_padding_stations_on_a_foundation():
+    """Shear, moment and deflection don't drop to zero where sub-elements meet."""
+    from pycba_tools.model import _span_stations
+
+    model = raft_strip()
+    model.analyze()
+    for s in _span_stations(model.analyses["D"]):
+        assert (s["D"] < 0).all()
+        runs = np.flatnonzero(np.isclose(np.diff(s["x"]), 0.0, atol=1e-9))
+        assert not np.any(np.diff(runs) == 1)  # no 3 stations at one x
