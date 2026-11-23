@@ -1303,16 +1303,30 @@ def _span_stations(beam_analysis: BeamAnalysis) -> list[dict[str, np.ndarray]]:
     Per-span station arrays (global x, V, M, D, R) from an analysed BeamAnalysis.
     pycba pads each span with duplicated end stations; the interior stations are
     the evaluation grid.
+
+    A span on a foundation is pycba's sub-elements joined end to end, and each
+    keeps its padding: where two meet, the stations are [end, pad, pad,
+    start], all at one x, and the pads read zero (or rounding noise) for V,
+    M and D. Only the first and last of such a run are kept, so the pads
+    don't show as the beam touching zero deflection (a false edge of the
+    foundation contact) or as zero shear and moment mid-span.
     """
     stations = []
     for res in beam_analysis.beam_results.vRes:
+        x = np.asarray(res.x[1:-1], dtype=float)
+        keep = np.ones(len(x), dtype=bool)
+        tol = 1e-9 * max(1.0, float(np.abs(x).max())) if len(x) else 0.0
+        same = np.abs(x[1:] - x[:-1]) <= tol
+        same_left = np.r_[False, same]
+        same_right = np.r_[same, False]
+        keep[same_left & same_right] = False  # inside a run of 3 or more
         stations.append(
             {
-                "x": np.asarray(res.x[1:-1], dtype=float),
-                "V": np.asarray(res.V[1:-1], dtype=float),
-                "M": np.asarray(res.M[1:-1], dtype=float),
-                "D": np.asarray(res.D[1:-1], dtype=float),
-                "R": np.asarray(res.R[1:-1], dtype=float),
+                "x": x[keep],
+                "V": np.asarray(res.V[1:-1], dtype=float)[keep],
+                "M": np.asarray(res.M[1:-1], dtype=float)[keep],
+                "D": np.asarray(res.D[1:-1], dtype=float)[keep],
+                "R": np.asarray(res.R[1:-1], dtype=float)[keep],
             }
         )
     return stations
